@@ -1542,8 +1542,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
-		// 显式生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
-		if useWebsocket && explicitlyRequestsImageGeneration(rawBody) {
+		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
+		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
+		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
 			useWebsocket = false
 		}
 

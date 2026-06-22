@@ -245,6 +245,87 @@ func TestExplicitlyRequestsImageGeneration(t *testing.T) {
 	}
 }
 
+func TestResponsesBodyHasNaturalImageGenerationIntent(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{
+			name: "chinese_direct_generation",
+			body: []byte(`{"model":"gpt-5.5","input":"帮我生成一张赛博朋克风格的猫图片"}`),
+			want: true,
+		},
+		{
+			name: "prompt_compat_generation",
+			body: []byte(`{"model":"gpt-5.5","prompt":"画一张水彩风的山景"}`),
+			want: true,
+		},
+		{
+			name: "meme_generation_not_table",
+			body: []byte(`{"model":"gpt-5.5","input":"生成一张表情包"}`),
+			want: true,
+		},
+		{
+			name: "image_edit_text_part",
+			body: []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":[{"type":"input_text","text":"edit this image to make the background blue"}]}]}`),
+			want: true,
+		},
+		{
+			name: "plain_chat",
+			body: []byte(`{"model":"gpt-5.5","input":"hello, explain this error"}`),
+			want: false,
+		},
+		{
+			name: "script_request",
+			body: []byte(`{"model":"gpt-5.5","input":"帮我写一个生成图片的 Python 脚本"}`),
+			want: false,
+		},
+		{
+			name: "api_question",
+			body: []byte(`{"model":"gpt-5.5","input":"介绍一下 image generation API 怎么调用"}`),
+			want: false,
+		},
+		{
+			name: "table_request",
+			body: []byte(`{"model":"gpt-5.5","input":"生成一张表格对比这些方案"}`),
+			want: false,
+		},
+		{
+			name: "diagram_code_request",
+			body: []byte(`{"model":"gpt-5.5","input":"生成一张架构图的 Mermaid 代码"}`),
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := responsesBodyHasNaturalImageGenerationIntent(tc.body); got != tc.want {
+				t.Fatalf("responsesBodyHasNaturalImageGenerationIntent() = %v, want %v for %s", got, tc.want, tc.body)
+			}
+		})
+	}
+}
+
+func TestRawResponsesBodyShouldForceHTTPForImageGeneration(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{"explicit_tool_choice", []byte(`{"model":"gpt-5.5","tool_choice":{"type":"image_generation"}}`), true},
+		{"natural_language_generation", []byte(`{"model":"gpt-5.5","input":"生成一张未来城市海报"}`), true},
+		{"plain_request", []byte(`{"model":"gpt-5.5","input":"hello"}`), false},
+		{"image_generation_code_request", []byte(`{"model":"gpt-5.5","input":"帮我写一个生成图片的 Python 脚本"}`), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rawResponsesBodyShouldForceHTTPForImageGeneration(tc.body); got != tc.want {
+				t.Fatalf("rawResponsesBodyShouldForceHTTPForImageGeneration() = %v, want %v for %s", got, tc.want, tc.body)
+			}
+		})
+	}
+}
+
 func TestStripResponsesImageGenerationToolRemovesInjectedTool(t *testing.T) {
 	// PrepareResponsesBody 默认给普通请求注入 image_generation 工具 + 桥接 instructions；WS 路径需全部剥离。
 	prepared, _ := PrepareResponsesBody([]byte(`{"model":"gpt-5.5","input":"hello"}`))

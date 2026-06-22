@@ -567,6 +567,219 @@ func explicitlyRequestsImageGeneration(body []byte) bool {
 	return responsesBodyRequestsImageGeneration(body) || responsesBodyHasImageGenerationTool(body)
 }
 
+// rawResponsesBodyShouldForceHTTPForImageGeneration must receive the downstream
+// raw Responses body before PrepareResponsesBody injects the default
+// image_generation tool. Passing a prepared Codex body would misclassify plain
+// chat as an image request.
+func rawResponsesBodyShouldForceHTTPForImageGeneration(body []byte) bool {
+	return explicitlyRequestsImageGeneration(body) || responsesBodyHasNaturalImageGenerationIntent(body)
+}
+
+func responsesBodyHasNaturalImageGenerationIntent(body []byte) bool {
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return false
+	}
+	return promptTextRequestsImageGeneration(extractResponsesPromptText(parsed))
+}
+
+func promptTextRequestsImageGeneration(text string) bool {
+	normalized := normalizeImageIntentText(text)
+	if normalized == "" {
+		return false
+	}
+	if containsAnyPhrase(normalized, imageIntentFalsePositivePhrases) {
+		return false
+	}
+	return containsAnyPhrase(normalized, imageIntentPositivePhrases)
+}
+
+func normalizeImageIntentText(text string) string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" {
+		return ""
+	}
+	replacer := strings.NewReplacer(
+		"\r", " ",
+		"\n", " ",
+		"\t", " ",
+		"，", " ",
+		"。", " ",
+		"！", " ",
+		"？", " ",
+		"；", " ",
+		"：", " ",
+		",", " ",
+		".", " ",
+		"!", " ",
+		"?", " ",
+		";", " ",
+		":", " ",
+		"\"", " ",
+		"'", " ",
+		"`", " ",
+	)
+	return strings.Join(strings.Fields(replacer.Replace(text)), " ")
+}
+
+func containsAnyPhrase(text string, phrases []string) bool {
+	for _, phrase := range phrases {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+var imageIntentFalsePositivePhrases = []string{
+	"生成图片的代码",
+	"生成图片代码",
+	"生成图片的脚本",
+	"生成图片脚本",
+	"生成图片的函数",
+	"生成图片函数",
+	"图片生成函数",
+	"写一个生成图片",
+	"写个生成图片",
+	"代码",
+	"脚本",
+	"函数",
+	"接口",
+	"教程",
+	"示例",
+	"文档",
+	"提示词",
+	"生成图片接口",
+	"生图接口",
+	"生成图片 api",
+	"生图 api",
+	"生成图片 sdk",
+	"生图 sdk",
+	"生成图片教程",
+	"生图教程",
+	"生成图片示例",
+	"生图示例",
+	"生成图片的提示词",
+	"生图提示词",
+	"生成一张表格",
+	"生成一张清单",
+	"生成一张列表",
+	"生成一张报告",
+	"生成一张计划",
+	"如何生成图片",
+	"怎么生成图片",
+	"如何生图",
+	"怎么生图",
+	"how to generate an image",
+	"how do i generate an image",
+	"generate an image with python",
+	"generate images with python",
+	"image generation code",
+	"image generation api",
+	"image generation sdk",
+	"image generation tutorial",
+	"image generation example",
+	"image prompt",
+	"write code",
+	"write a script",
+	" code",
+	"code ",
+	"script",
+	"function",
+	"tutorial",
+	"example",
+	"documentation",
+	"mermaid",
+	"python script",
+	"javascript",
+	"typescript",
+	"html canvas",
+	"svg",
+}
+
+var imageIntentPositivePhrases = []string{
+	"生图",
+	"文生图",
+	"图生图",
+	"生成一张",
+	"生成一幅",
+	"生成图片",
+	"生成照片",
+	"生成海报",
+	"生成封面",
+	"生成头像",
+	"生成壁纸",
+	"生成插画",
+	"生成漫画",
+	"生成表情包",
+	"生成一张表情包",
+	"生成图标",
+	"生成logo",
+	"生成 logo",
+	"画一张",
+	"画一幅",
+	"画一个",
+	"画个",
+	"帮我画",
+	"请画",
+	"绘制一张",
+	"绘制一幅",
+	"做一张图",
+	"做张图",
+	"做一张图片",
+	"做个图",
+	"出一张图",
+	"出图",
+	"设计一张海报",
+	"设计一个海报",
+	"设计一个logo",
+	"设计一个 logo",
+	"设计图标",
+	"修图",
+	"改图",
+	"编辑图片",
+	"编辑照片",
+	"修改图片",
+	"修改照片",
+	"把这张图",
+	"将这张图",
+	"把图片",
+	"把照片",
+	"换背景",
+	"背景换",
+	"去背景",
+	"抠图",
+	"扩图",
+	"重绘",
+	"局部重绘",
+	"generate an image",
+	"generate a picture",
+	"generate a photo",
+	"create an image",
+	"create a picture",
+	"create a photo",
+	"make an image",
+	"make a picture",
+	"make a photo",
+	"draw me",
+	"draw a",
+	"draw an",
+	"paint a",
+	"paint an",
+	"illustrate a",
+	"illustrate an",
+	"design a poster",
+	"design a logo",
+	"edit this image",
+	"edit the image",
+	"modify this image",
+	"modify the image",
+	"retouch this photo",
+	"retouch the photo",
+	"turn this image",
+	"make this image",
+}
+
 // stripResponsesImageGenerationTool 移除请求体中的 image_generation 工具及指向它的
 // tool_choice。仅在 WebSocket 上游模式下、且请求未显式要求生图时使用：此时 body 中
 // 的 image_generation 工具一定是 PrepareResponsesBody 自动注入的，移除后可防止模型
