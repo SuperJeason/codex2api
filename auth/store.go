@@ -1675,6 +1675,16 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 			return now.Sub(a.UsageUpdatedAt5h) > maxAge
 		}
 	}
+	// 5h 用量窗口的重置时间已过、但快照仍停留在重置前采集的高用量（展示的是过期数据）→
+	// 触发一次 wham 刷新，让 5h 进度条与 premium 5h 限流冷却跟随官方窗口重置而恢复。
+	// （7d 窗口的过期数据已被上面的 7d 新鲜度检查覆盖；5h 检查此前仅在 Reset5hAt 未过期时生效，
+	// 重置后会一直停在旧值，这里补上。）
+	// now.Sub(UsageUpdatedAt5h) > maxAge 既能在窗口重置后尽快触发，也能在上游偶尔不返回该窗口时
+	// 限制探测频率，避免反复探针。
+	if a.UsagePercent5hValid && a.UsagePercent5h > 0 && !a.Reset5hAt.IsZero() &&
+		!a.Reset5hAt.After(now) && now.Sub(a.UsageUpdatedAt5h) > maxAge {
+		return true
+	}
 	return false
 }
 
