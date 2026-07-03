@@ -94,10 +94,16 @@ type Account struct {
 	effectiveAutoPause7d        float64
 	autoPause5hGuardBandPercent float64 // percentage points, 0 = disabled
 	autoPause5hGuardConcurrency int     // 0 = disabled; otherwise guard-band concurrency cap
-	DispatchCountLimit          int64   // 0 = disabled; per-reset-window dispatch cap
-	dispatchCountMu             sync.Mutex
-	dispatchWindowUsed          int64
-	dispatchWindowResetAt       time.Time
+	// 智能配速（issue #312）：按剩余配额/剩余时间把用量匀速摊到窗口重置，
+	// 燃烧过快时按可持续速率缩放并发。参数由 Store 全局设置快照而来。
+	smartPacingEnabled        bool
+	smartPacingMinConcurrency int
+	smartPacingWindows5h      bool
+	smartPacingWindows7d      bool
+	DispatchCountLimit        int64 // 0 = disabled; per-reset-window dispatch cap
+	dispatchCountMu           sync.Mutex
+	dispatchWindowUsed        int64
+	dispatchWindowResetAt     time.Time
 
 	// 调度健康信号
 	HealthTier               AccountHealthTier
@@ -897,6 +903,7 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	a.ScoreBiasEffective = scoreBiasEffective
 	a.BaseConcurrencyEffective = baseConcurrencyEffective
 	a.DynamicConcurrencyLimit = a.quotaAutoPause5hGuardConcurrencyLimitLocked(concurrencyLimitForTier(baseConcurrencyEffective, tier), now)
+	a.DynamicConcurrencyLimit = a.smartPacingConcurrencyLimitLocked(a.DynamicConcurrencyLimit, now)
 	if a.premium5hRateLimitedLocked(now) && a.DynamicConcurrencyLimit > 1 {
 		a.DynamicConcurrencyLimit = 1
 	}
@@ -964,7 +971,85 @@ const (
 	defaultAutoPause5hGuardBandPercent = 5.0
 	defaultAutoPause5hGuardConcurrency = 1
 	maxAutoPause5hGuardDispatchPenalty = 50.0
+
+	defaultSmartPacingMinConcurrency = 1
+	smartPacingWindow5h              = 5 * time.Hour
+	smartPacingWindow7d              = 7 * 24 * time.Hour
 )
+
+func normalizeSmartPacingMinConcurrency(value int) int {
+	if value < 1 {
+		return 1
+	}
+	if value > 1000 {
+		return 1000
+	}
+	return value
+}
+
+// parseSmartPacingWindows 解析 "5h,7d" 形式，返回是否对 5h / 7d 窗口配速。
+// 空或非法一律回退为两个窗口都启用。
+func parseSmartPacingWindows(raw string) (bool, bool) {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return true, true
+	}
+	var w5h, w7d bool
+	for _, part := range strings.Split(raw, ",") {
+		switch strings.TrimSpace(part) {
+		case "5h":
+			w5h = true
+		case "7d":
+			w7d = true
+		}
+	}
+	if !w5h && !w7d {
+		return true, true
+	}
+	return w5h, w7d
+}
+
+// normalizeSmartPacingWindows 归一化为规范字符串（用于持久化与展示）。
+func normalizeSmartPacingWindows(raw string) string {
+	w5h, w7d := parseSmartPacingWindows(raw)
+	switch {
+	case w5h && w7d:
+		return "5h,7d"
+	case w5h:
+		return "5h"
+	default:
+		return "7d"
+	}
+}
+
+// smartPacingRatio 计算某窗口的"配速比" = 可持续速率 / 自然速率。
+//
+//	可持续速率 = 剩余配额% / 剩余时间
+//	自然速率   = 100% / 窗口长度（把整窗配额均匀铺满整段窗口的速率）
+//	ratio      = 剩余配额% × 窗口长度 / (100 × 剩余时间)
+//
+// ratio >= 1 表示未超前燃烧（无需限速）；ratio < 1 表示烧太快，需按比例压并发。
+// ok=false 表示用量/重置信号无效或窗口已翻新，此时不介入。
+func smartPacingRatio(usage float64, valid bool, resetAt time.Time, window time.Duration, now time.Time) (float64, bool) {
+	if !valid || resetAt.IsZero() || window <= 0 {
+		return 0, false
+	}
+	remainingTime := resetAt.Sub(now)
+	if remainingTime <= 0 {
+		return 0, false
+	}
+	remainingPct := 100 - usage
+	if remainingPct <= 0 {
+		// 已耗尽，交给限流/自动暂停逻辑处理，配速不越权。
+		return 0, false
+	}
+	sustainable := remainingPct / remainingTime.Seconds()
+	natural := 100.0 / window.Seconds()
+	if natural <= 0 {
+		return 0, false
+	}
+	return sustainable / natural, true
+}
 
 func normalizeAutoPause5hGuardBandPercent(value float64) float64 {
 	if value < 0 {
@@ -1014,6 +1099,47 @@ func (a *Account) quotaAutoPause5hGuardConcurrencyLimitLocked(limit int64, now t
 	return limit
 }
 
+// smartPacingConcurrencyLimitLocked 智能配速（issue #312）：当账号在某个用量窗口内
+// "燃烧过快"（已用比例超过按时间匀速的应用比例）时，按可持续速率与自然速率之比缩放
+// 并发上限，让剩余配额平滑用到窗口重置那一刻，而不是提前撞到 5h/7d 限流。
+// 只在有有效用量信号 + 重置时间时介入；5h/7d 两个窗口取更严格（更小）的比值。
+func (a *Account) smartPacingConcurrencyLimitLocked(limit int64, now time.Time) int64 {
+	if !a.smartPacingEnabled || limit <= 1 {
+		return limit
+	}
+	floor := int64(a.smartPacingMinConcurrency)
+	if floor < 1 {
+		floor = 1
+	}
+	if floor >= limit {
+		return limit
+	}
+
+	ratio := 1.0
+	if a.smartPacingWindows5h {
+		if r, ok := smartPacingRatio(a.UsagePercent5h, a.UsagePercent5hValid, a.Reset5hAt, smartPacingWindow5h, now); ok && r < ratio {
+			ratio = r
+		}
+	}
+	if a.smartPacingWindows7d {
+		if r, ok := smartPacingRatio(a.UsagePercent7d, a.UsagePercent7dValid, a.Reset7dAt, smartPacingWindow7d, now); ok && r < ratio {
+			ratio = r
+		}
+	}
+	if ratio >= 1 {
+		return limit
+	}
+
+	scaled := int64(math.Ceil(float64(limit) * ratio))
+	if scaled < floor {
+		scaled = floor
+	}
+	if scaled > limit {
+		scaled = limit
+	}
+	return scaled
+}
+
 func (a *Account) quotaAutoPause5hGuardDispatchPenaltyLocked(now time.Time) float64 {
 	if a.AutoPause5hDisabled || a.effectiveAutoPause5h <= 0 || !a.UsagePercent5hValid || a.autoPause5hGuardBandPercent <= 0 || a.autoPause5hGuardConcurrency <= 0 {
 		return 0
@@ -1043,9 +1169,16 @@ func (a *Account) recomputeEffectiveAutoPause(s *Store) {
 	if s != nil {
 		a.autoPause5hGuardBandPercent = s.GetAutoPause5hGuardBandPercent()
 		a.autoPause5hGuardConcurrency = s.GetAutoPause5hGuardConcurrency()
+		a.smartPacingEnabled = s.GetSmartPacingEnabled()
+		a.smartPacingMinConcurrency = s.GetSmartPacingMinConcurrency()
+		a.smartPacingWindows5h, a.smartPacingWindows7d = parseSmartPacingWindows(s.GetSmartPacingWindows())
 	} else {
 		a.autoPause5hGuardBandPercent = defaultAutoPause5hGuardBandPercent
 		a.autoPause5hGuardConcurrency = defaultAutoPause5hGuardConcurrency
+		a.smartPacingEnabled = false
+		a.smartPacingMinConcurrency = defaultSmartPacingMinConcurrency
+		a.smartPacingWindows5h = true
+		a.smartPacingWindows7d = true
 	}
 }
 
@@ -1875,6 +2008,9 @@ type Store struct {
 	globalAutoPause7dThreshold  float64  // protected by mu
 	autoPause5hGuardBandPercent float64  // protected by mu, percentage points
 	autoPause5hGuardConcurrency int      // protected by mu, 0 = disabled
+	smartPacingEnabled          bool     // protected by mu; issue #312 智能配速总开关
+	smartPacingMinConcurrency   int      // protected by mu, 配速并发下限
+	smartPacingWindows          string   // protected by mu, "5h,7d" / "5h" / "7d"
 	groupAutoPauseThresholds    sync.Map // int64 -> [2]float64 {5h, 7d}
 }
 
@@ -2255,6 +2391,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			CodexWSSilentMaxRetries:            2,
 			AutoPause5hGuardBandPercent:        defaultAutoPause5hGuardBandPercent,
 			AutoPause5hGuardConcurrency:        defaultAutoPause5hGuardConcurrency,
+			SmartPacingMinConcurrency:          defaultSmartPacingMinConcurrency,
+			SmartPacingWindows:                 "5h,7d",
 		}
 	}
 	s := &Store{
@@ -2325,6 +2463,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause7dThreshold)
 	s.autoPause5hGuardBandPercent = normalizeAutoPause5hGuardBandPercent(settings.AutoPause5hGuardBandPercent)
 	s.autoPause5hGuardConcurrency = normalizeAutoPause5hGuardConcurrency(settings.AutoPause5hGuardConcurrency)
+	s.smartPacingEnabled = settings.SmartPacingEnabled
+	s.smartPacingMinConcurrency = normalizeSmartPacingMinConcurrency(settings.SmartPacingMinConcurrency)
+	s.smartPacingWindows = normalizeSmartPacingWindows(settings.SmartPacingWindows)
 
 	// 加载代理池
 	if settings.ProxyPoolEnabled {
@@ -4137,6 +4278,54 @@ func (s *Store) GetAutoPause5hGuardConcurrency() int {
 	s.mu.RLock()
 	v := s.autoPause5hGuardConcurrency
 	s.mu.RUnlock()
+	return v
+}
+
+func (s *Store) SetSmartPacingEnabled(value bool) {
+	s.mu.Lock()
+	s.smartPacingEnabled = value
+	s.mu.Unlock()
+	s.recomputeAllEffectiveAutoPause()
+}
+
+func (s *Store) GetSmartPacingEnabled() bool {
+	s.mu.RLock()
+	v := s.smartPacingEnabled
+	s.mu.RUnlock()
+	return v
+}
+
+func (s *Store) SetSmartPacingMinConcurrency(value int) {
+	s.mu.Lock()
+	s.smartPacingMinConcurrency = normalizeSmartPacingMinConcurrency(value)
+	s.mu.Unlock()
+	s.recomputeAllEffectiveAutoPause()
+}
+
+func (s *Store) GetSmartPacingMinConcurrency() int {
+	s.mu.RLock()
+	v := s.smartPacingMinConcurrency
+	s.mu.RUnlock()
+	if v < 1 {
+		v = defaultSmartPacingMinConcurrency
+	}
+	return v
+}
+
+func (s *Store) SetSmartPacingWindows(value string) {
+	s.mu.Lock()
+	s.smartPacingWindows = normalizeSmartPacingWindows(value)
+	s.mu.Unlock()
+	s.recomputeAllEffectiveAutoPause()
+}
+
+func (s *Store) GetSmartPacingWindows() string {
+	s.mu.RLock()
+	v := s.smartPacingWindows
+	s.mu.RUnlock()
+	if v == "" {
+		return "5h,7d"
+	}
 	return v
 }
 

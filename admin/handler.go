@@ -5630,6 +5630,9 @@ type settingsResponse struct {
 	AutoPause7dThreshold               float64 `json:"auto_pause_7d_threshold"`
 	AutoPause5hGuardBandPercent        float64 `json:"auto_pause_5h_guard_band_percent"`
 	AutoPause5hGuardConcurrency        int     `json:"auto_pause_5h_guard_concurrency"`
+	SmartPacingEnabled                 bool    `json:"smart_pacing_enabled"`
+	SmartPacingMinConcurrency          int     `json:"smart_pacing_min_concurrency"`
+	SmartPacingWindows                 string  `json:"smart_pacing_windows"`
 }
 
 type updateSettingsReq struct {
@@ -5717,6 +5720,9 @@ type updateSettingsReq struct {
 	AutoPause7dThreshold               *float64 `json:"auto_pause_7d_threshold"`
 	AutoPause5hGuardBandPercent        *float64 `json:"auto_pause_5h_guard_band_percent"`
 	AutoPause5hGuardConcurrency        *int     `json:"auto_pause_5h_guard_concurrency"`
+	SmartPacingEnabled                 *bool    `json:"smart_pacing_enabled"`
+	SmartPacingMinConcurrency          *int     `json:"smart_pacing_min_concurrency"`
+	SmartPacingWindows                 *string  `json:"smart_pacing_windows"`
 }
 
 type brandingResponse struct {
@@ -6300,6 +6306,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
 		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
 		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
+		SmartPacingEnabled:                 h.store.GetSmartPacingEnabled(),
+		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
+		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
 	})
 }
 
@@ -6332,6 +6341,20 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.AutoPause5hGuardConcurrency != nil {
 		if *req.AutoPause5hGuardConcurrency < 0 || *req.AutoPause5hGuardConcurrency > 1000 {
 			writeError(c, http.StatusBadRequest, "auto_pause_5h_guard_concurrency 需在 0 到 1000 之间")
+			return
+		}
+	}
+	if req.SmartPacingMinConcurrency != nil {
+		if *req.SmartPacingMinConcurrency < 1 || *req.SmartPacingMinConcurrency > 1000 {
+			writeError(c, http.StatusBadRequest, "smart_pacing_min_concurrency 需在 1 到 1000 之间")
+			return
+		}
+	}
+	if req.SmartPacingWindows != nil {
+		switch strings.ToLower(strings.TrimSpace(*req.SmartPacingWindows)) {
+		case "5h,7d", "7d,5h", "5h", "7d", "":
+		default:
+			writeError(c, http.StatusBadRequest, "smart_pacing_windows 仅支持 5h,7d / 5h / 7d")
 			return
 		}
 	}
@@ -6745,6 +6768,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetAutoPause5hGuardConcurrency(*req.AutoPause5hGuardConcurrency)
 		log.Printf("设置已更新: auto_pause_5h_guard_concurrency = %d", *req.AutoPause5hGuardConcurrency)
 	}
+	if req.SmartPacingEnabled != nil {
+		h.store.SetSmartPacingEnabled(*req.SmartPacingEnabled)
+		log.Printf("设置已更新: smart_pacing_enabled = %t", *req.SmartPacingEnabled)
+	}
+	if req.SmartPacingMinConcurrency != nil {
+		h.store.SetSmartPacingMinConcurrency(*req.SmartPacingMinConcurrency)
+		log.Printf("设置已更新: smart_pacing_min_concurrency = %d", *req.SmartPacingMinConcurrency)
+	}
+	if req.SmartPacingWindows != nil {
+		h.store.SetSmartPacingWindows(*req.SmartPacingWindows)
+		log.Printf("设置已更新: smart_pacing_windows = %s", h.store.GetSmartPacingWindows())
+	}
 	runtimeCfg = proxy.ApplyRuntimeSettings(runtimeCfg)
 
 	usageLogChanged := false
@@ -7017,6 +7052,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
 		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
 		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
+		SmartPacingEnabled:                 h.store.GetSmartPacingEnabled(),
+		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
+		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -7126,6 +7164,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
 		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
 		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
+		SmartPacingEnabled:                 h.store.GetSmartPacingEnabled(),
+		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
+		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
 	})
 }
 

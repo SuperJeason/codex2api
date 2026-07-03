@@ -615,6 +615,9 @@ export interface SystemSettings {
   auto_pause_7d_threshold: number
   auto_pause_5h_guard_band_percent: number
   auto_pause_5h_guard_concurrency: number
+  smart_pacing_enabled: boolean
+  smart_pacing_min_concurrency: number
+  smart_pacing_windows: string
 }
 
 export interface SetupHintsResponse {
