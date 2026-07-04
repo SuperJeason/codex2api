@@ -4382,7 +4382,7 @@ func (h *Handler) syncSingleAccountPlanOnReset(ctx context.Context, acc *auth.Ac
 	if err != nil {
 		return err
 	}
-	resp, err := proxy.ExecuteRequest(ctx, acc, buildTestPayload(model), "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
+	resp, err := proxy.ExecuteRequest(ctx, acc, buildConnectionTestPayload(h.store, model), "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
 	if err != nil {
 		return err
 	}
@@ -5622,6 +5622,7 @@ type settingsResponse struct {
 	MaxConcurrency                     int     `json:"max_concurrency"`
 	GlobalRPM                          int     `json:"global_rpm"`
 	TestModel                          string  `json:"test_model"`
+	TestContent                        string  `json:"test_content"`
 	TestConcurrency                    int     `json:"test_concurrency"`
 	BackgroundRefreshIntervalMinutes   int     `json:"background_refresh_interval_minutes"`
 	UsageProbeMaxAgeMinutes            int     `json:"usage_probe_max_age_minutes"`
@@ -5719,6 +5720,7 @@ type updateSettingsReq struct {
 	MaxConcurrency                     *int     `json:"max_concurrency"`
 	GlobalRPM                          *int     `json:"global_rpm"`
 	TestModel                          *string  `json:"test_model"`
+	TestContent                        *string  `json:"test_content"`
 	TestConcurrency                    *int     `json:"test_concurrency"`
 	BackgroundRefreshIntervalMinutes   *int     `json:"background_refresh_interval_minutes"`
 	UsageProbeMaxAgeMinutes            *int     `json:"usage_probe_max_age_minutes"`
@@ -5962,6 +5964,14 @@ func backgroundAssetPath(filename string) (string, bool) {
 
 func backgroundAssetURL(filename string) string {
 	return backgroundAssetURLPrefix + filename
+}
+
+func validateConnectionTestContent(content string) (string, error) {
+	normalized := auth.NormalizeTestContent(content)
+	if len([]rune(normalized)) > auth.MaxTestContentRunes {
+		return "", fmt.Errorf("test_content 不能超过 %d 个字符", auth.MaxTestContentRunes)
+	}
+	return normalized, nil
 }
 
 func randomBackgroundAssetFilename(ext string) string {
@@ -6299,6 +6309,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		MaxConcurrency:                     h.store.GetMaxConcurrency(),
 		GlobalRPM:                          h.rateLimiter.GetRPM(),
 		TestModel:                          h.store.GetTestModel(),
+		TestContent:                        h.store.GetTestContent(),
 		TestConcurrency:                    h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes:   h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:            h.store.GetUsageProbeMaxAgeMinutes(),
@@ -6523,6 +6534,16 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.TestModel != nil && *req.TestModel != "" {
 		h.store.SetTestModel(*req.TestModel)
 		log.Printf("设置已更新: test_model = %s", *req.TestModel)
+	}
+
+	if req.TestContent != nil {
+		testContent, err := validateConnectionTestContent(*req.TestContent)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		h.store.SetTestContent(testContent)
+		log.Printf("设置已更新: test_content (长度=%d)", len([]rune(testContent)))
 	}
 
 	if req.TestConcurrency != nil {
@@ -7057,6 +7078,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		MaxConcurrency:                     h.store.GetMaxConcurrency(),
 		GlobalRPM:                          h.rateLimiter.GetRPM(),
 		TestModel:                          h.store.GetTestModel(),
+		TestContent:                        h.store.GetTestContent(),
 		TestConcurrency:                    h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes:   h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:            h.store.GetUsageProbeMaxAgeMinutes(),
@@ -7157,6 +7179,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		MaxConcurrency:                     h.store.GetMaxConcurrency(),
 		GlobalRPM:                          h.rateLimiter.GetRPM(),
 		TestModel:                          h.store.GetTestModel(),
+		TestContent:                        h.store.GetTestContent(),
 		TestConcurrency:                    h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes:   h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:            h.store.GetUsageProbeMaxAgeMinutes(),
