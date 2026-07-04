@@ -41,13 +41,14 @@ var (
 )
 
 type systemUpdater struct {
-	currentVersion string
-	client         systemReleaseClient
-	goos           string
-	goarch         string
-	executablePath func() (string, error)
-	restartProcess func() error
-	restartDelay   time.Duration
+	currentVersion     string
+	client             systemReleaseClient
+	goos               string
+	goarch             string
+	executablePath     func() (string, error)
+	restartProcess     func() error
+	restartDelay       time.Duration
+	runningInContainer func() bool
 
 	mu                    sync.Mutex
 	releaseCacheMu        sync.Mutex
@@ -116,14 +117,32 @@ type defaultSystemReleaseClient struct {
 func newSystemUpdater() *systemUpdater {
 	client := newDefaultSystemReleaseClient()
 	return &systemUpdater{
-		currentVersion: version.Current(),
-		client:         client,
-		goos:           runtime.GOOS,
-		goarch:         runtime.GOARCH,
-		executablePath: os.Executable,
-		restartProcess: defaultRestartProcess,
-		restartDelay:   systemUpdateRestartDelay,
+		currentVersion:     version.Current(),
+		client:             client,
+		goos:               runtime.GOOS,
+		goarch:             runtime.GOARCH,
+		executablePath:     os.Executable,
+		restartProcess:     defaultRestartProcess,
+		restartDelay:       systemUpdateRestartDelay,
+		runningInContainer: detectRunningInContainer,
 	}
+}
+
+// detectRunningInContainer 尽力判断当前进程是否运行在容器内:
+// 更新容器内的二进制在容器重建后会被镜像版本覆盖,需要提示用户改用镜像升级。
+func detectRunningInContainer() bool {
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	if _, err := os.Stat("/run/.containerenv"); err == nil { // podman
+		return true
+	}
+	data, err := os.ReadFile("/proc/1/cgroup")
+	if err != nil {
+		return false
+	}
+	content := string(data)
+	return strings.Contains(content, "docker") || strings.Contains(content, "kubepods") || strings.Contains(content, "containerd")
 }
 
 func newDefaultSystemReleaseClient() *defaultSystemReleaseClient {
@@ -247,6 +266,9 @@ func (u *systemUpdater) inspect(ctx context.Context) (*systemUpdateInspection, e
 	if u.goos == "windows" {
 		info.Supported = false
 		info.UnsupportedReason = "Windows 运行时暂不支持在线替换正在运行的可执行文件"
+	}
+	if u.runningInContainer != nil && u.runningInContainer() {
+		info.Warning = "检测到容器环境:在线更新只替换当前容器内的二进制,容器重建后会恢复为镜像自带版本,建议改用拉取新镜像的方式升级"
 	}
 
 	release, err := u.fetchLatestRelease(ctx)

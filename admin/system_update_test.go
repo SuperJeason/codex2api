@@ -127,6 +127,40 @@ func TestSystemUpdaterCheckFindsMatchingAsset(t *testing.T) {
 	}
 }
 
+func TestSystemUpdaterContainerWarning(t *testing.T) {
+	client := &fakeSystemReleaseClient{release: &systemGitHubRelease{
+		TagName: "v2.4.4",
+		Assets:  []systemGitHubAsset{{Name: "codex2api_2.4.4_linux_amd64.tar.gz"}},
+	}}
+	updater := &systemUpdater{
+		currentVersion:     "v2.4.3",
+		client:             client,
+		goos:               "linux",
+		goarch:             "amd64",
+		runningInContainer: func() bool { return true },
+	}
+
+	info, err := updater.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check() error: %v", err)
+	}
+	if !info.Supported {
+		t.Fatalf("Supported = false: %s", info.UnsupportedReason)
+	}
+	if info.Warning == "" {
+		t.Fatal("Warning is empty, want container warning")
+	}
+
+	updater.runningInContainer = func() bool { return false }
+	info, err = updater.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check() error: %v", err)
+	}
+	if info.Warning != "" {
+		t.Fatalf("Warning = %q, want empty outside container", info.Warning)
+	}
+}
+
 func TestSystemUpdaterRejectsDevBuild(t *testing.T) {
 	client := &fakeSystemReleaseClient{release: &systemGitHubRelease{
 		TagName: "v2.4.4",

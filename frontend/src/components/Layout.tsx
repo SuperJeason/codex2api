@@ -355,6 +355,11 @@ export default function Layout({ children }: PropsWithChildren) {
                               {updateUnavailableReason}
                             </div>
                           )}
+                          {hasUpdate && updateInfo?.warning && (
+                            <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] font-medium leading-relaxed text-amber-700">
+                              {updateInfo.warning}
+                            </div>
+                          )}
                           {hasUpdate && (
                             <button
                               type="button"
