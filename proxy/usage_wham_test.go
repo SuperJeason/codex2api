@@ -92,6 +92,46 @@ func TestQueryWhamUsage_ParsesPlusAccountResponse(t *testing.T) {
 	}
 }
 
+func TestQueryWhamUsage_UsesCustomHeaderAccountIDOverride(t *testing.T) {
+	var gotAccountID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAccountID = r.Header.Get("chatgpt-account-id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type": "plus", "rate_limit": {}}`))
+	}))
+	defer server.Close()
+
+	account := &auth.Account{
+		DBID:          1,
+		AccessToken:   "at-123",
+		AccountID:     "acc-1",
+		CustomHeaders: map[string]string{"Chatgpt-Account-Id": "acc-override"},
+	}
+	if _, _, err := queryWhamUsageWithURL(context.Background(), account, "", server.URL); err != nil {
+		t.Fatalf("queryWhamUsageWithURL error: %v", err)
+	}
+	if gotAccountID != "acc-override" {
+		t.Errorf("chatgpt-account-id = %q, want acc-override", gotAccountID)
+	}
+}
+
+func TestApplyWhamUsage_SkipsIdentityWriteBackWhenAccountIDOverridden(t *testing.T) {
+	account := &auth.Account{
+		DBID:          1,
+		AccessToken:   "at",
+		AccountID:     "acc-real",
+		CustomHeaders: map[string]string{"Chatgpt-Account-Id": "acc-override"},
+	}
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4"})
+
+	usage := &WhamUsage{PlanType: "plus", AccountID: "acc-override", Email: "a@b.c"}
+	ApplyWhamUsage(store, account, usage)
+
+	if got := account.AccountID; got != "acc-real" {
+		t.Errorf("AccountID = %q, want acc-real (identity must not be overwritten by overridden workspace)", got)
+	}
+}
+
 func TestApplyWhamUsage_PersistsPlanAnd5h7d(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")

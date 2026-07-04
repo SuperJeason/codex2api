@@ -351,6 +351,32 @@ func (a *Account) GetCustomHeaders() map[string]string {
 	return cloneStringMap(a.CustomHeaders)
 }
 
+// EffectiveAccountID 返回实际用于上游路由的工作区 ID:自定义请求头覆盖了
+// Chatgpt-Account-Id 时以覆盖值为准(与 proxy/wsrelay 转发行为一致),
+// 额度探测等旁路请求必须用它,否则统计的是与流量不同的空间。
+func (a *Account) EffectiveAccountID() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if v := strings.TrimSpace(a.CustomHeaders["Chatgpt-Account-Id"]); v != "" {
+		return v
+	}
+	return strings.TrimSpace(a.AccountID)
+}
+
+// AccountIDOverridden 判断自定义请求头是否把流量导向了与 OAuth 身份不同的空间。
+func (a *Account) AccountIDOverridden() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	v := strings.TrimSpace(a.CustomHeaders["Chatgpt-Account-Id"])
+	return v != "" && v != strings.TrimSpace(a.AccountID)
+}
+
 func clampInt(value, minValue, maxValue int) int {
 	if value < minValue {
 		return minValue
