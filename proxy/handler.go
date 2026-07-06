@@ -233,14 +233,23 @@ func accountFilterForModel(model string) auth.AccountFilter {
 }
 
 func accountFilterForResponsesModel(model string, allowCodexAccounts bool) auth.AccountFilter {
-	model = strings.TrimSpace(model)
-	codexFilter := accountFilterForModel(model)
+	return accountFilterForResponsesModelWithOriginal(model, model, allowCodexAccounts)
+}
+
+func accountFilterForResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
+	originalModel = strings.TrimSpace(originalModel)
+	effectiveModel = strings.TrimSpace(effectiveModel)
+	codexFilter := accountFilterForModel(effectiveModel)
 	return func(account *auth.Account) bool {
 		if account == nil {
 			return false
 		}
 		if account.IsOpenAIResponsesAPI() {
-			return account.SupportsOpenAIResponsesModel(model) && (model == "" || !account.IsModelRateLimited(model))
+			routedModel := effectiveModel
+			if mappedModel, ok := resolveAccountModelMappingForCandidates(account, originalModel, effectiveModel); ok && mappedModel != "" {
+				routedModel = mappedModel
+			}
+			return account.SupportsOpenAIResponsesModel(routedModel) && (routedModel == "" || !account.IsModelRateLimited(routedModel))
 		}
 		if !allowCodexAccounts {
 			return false
@@ -260,6 +269,44 @@ func modelIDInList(model string, models []string) bool {
 		}
 	}
 	return false
+}
+
+func (h *Handler) modelSupportedByAccountMapping(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" || h == nil || h.store == nil {
+		return false
+	}
+	for _, account := range h.store.Accounts() {
+		if account == nil || !account.IsOpenAIResponsesAPI() {
+			continue
+		}
+		mappedModel, ok := resolveAccountModelMapping(account, model)
+		if ok && mappedModel != "" && account.SupportsOpenAIResponsesModel(mappedModel) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) modelValidator(supportedModels []string) api.ValidationRule {
+	validModels := make(map[string]bool, len(supportedModels))
+	for _, model := range supportedModels {
+		validModels[model] = true
+	}
+	return func(value gjson.Result, path string) *api.ValidationError {
+		if !value.Exists() || value.Type != gjson.String {
+			return nil
+		}
+		model := value.String()
+		if validModels[model] || h.modelSupportedByAccountMapping(model) {
+			return nil
+		}
+		return &api.ValidationError{
+			Field:   path,
+			Message: fmt.Sprintf("Model '%s' is not supported", model),
+			Code:    "unsupported_model",
+		}
+	}
 }
 
 func effectiveRequestModel(body []byte, fallback string) string {
@@ -1443,7 +1490,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
-	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
+	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -1525,7 +1572,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
 	}
-	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	// 3. 带重试的上游请求
@@ -1562,6 +1609,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		attemptEffectiveModel := effectiveModel
+		attemptLogEffectiveModel := logEffectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
@@ -1604,7 +1653,13 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
-			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, getOpenAIResponsesBody(), proxyURL, downstreamHeaders)
+			upstreamBody := getOpenAIResponsesBody()
+			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel); ok {
+				upstreamBody = mappedBody
+				attemptEffectiveModel = mappedModel
+				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
+			}
+			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
@@ -1684,14 +1739,14 @@ func (h *Handler) Responses(c *gin.Context) {
 				log.Printf("OpenAI Responses 上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
-				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/responses",
 					Model:                logModel,
-					EffectiveModel:       logEffectiveModel,
+					EffectiveModel:       attemptLogEffectiveModel,
 					StatusCode:           resp.StatusCode,
 					DurationMs:           durationMs,
 					ReasoningEffort:      reasoningEffort,
@@ -1828,7 +1883,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			var responseFailedDecision codex429Decision
 			if len(terminalFailurePayload) > 0 {
 				outcome = classifyResponseFailedOutcome(terminalFailurePayload)
-				responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
+				responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, attemptEffectiveModel)
 				if responseFailedDecision.Reason != "" {
 					outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 				}
@@ -1875,7 +1930,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/responses",
 				Model:                logModel,
-				EffectiveModel:       logEffectiveModel,
+				EffectiveModel:       attemptLogEffectiveModel,
 				StatusCode:           outcome.logStatusCode,
 				DurationMs:           totalDuration,
 				FirstTokenMs:         firstTokenMs,
@@ -1911,7 +1966,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			} else if outcome.logStatusCode == http.StatusOK {
-				h.store.ClearModelCooldown(account, effectiveModel)
+				h.store.ClearModelCooldown(account, attemptEffectiveModel)
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -2355,7 +2410,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
-	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
+	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -2429,7 +2484,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	// compact 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
-	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	// compact 走中转账号时需要 OpenAI Responses 形态的请求体
@@ -2462,6 +2517,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		attemptEffectiveModel := effectiveModel
+		attemptLogEffectiveModel := logEffectiveModel
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 		apiKey = strings.TrimSpace(apiKey)
@@ -2474,7 +2531,13 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		if account.IsOpenAIResponsesAPI() {
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses/compact")
-			resp, reqErr := ExecuteOpenAIResponsesCompactRequest(c.Request.Context(), account, openAIResponsesBody, proxyURL, downstreamHeaders)
+			upstreamBody := openAIResponsesBody
+			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel); ok {
+				upstreamBody = mappedBody
+				attemptEffectiveModel = mappedModel
+				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
+			}
+			resp, reqErr := ExecuteOpenAIResponsesCompactRequest(c.Request.Context(), account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
@@ -2530,14 +2593,14 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 				logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
-				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/responses/compact",
 					Model:                logModel,
-					EffectiveModel:       logEffectiveModel,
+					EffectiveModel:       attemptLogEffectiveModel,
 					StatusCode:           resp.StatusCode,
 					DurationMs:           durationMs,
 					ReasoningEffort:      reasoningEffort,
@@ -2582,7 +2645,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/responses/compact",
 					Model:                logModel,
-					EffectiveModel:       logEffectiveModel,
+					EffectiveModel:       attemptLogEffectiveModel,
 					StatusCode:           http.StatusBadGateway,
 					DurationMs:           totalDuration,
 					ReasoningEffort:      reasoningEffort,
@@ -2607,7 +2670,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				return
 			}
 
-			h.store.ClearModelCooldown(account, effectiveModel)
+			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(durationMs)*time.Millisecond)
 
 			promptTokens := int(gjson.GetBytes(respBody, "usage.input_tokens").Int())
@@ -2629,7 +2692,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/responses/compact",
 				Model:                logModel,
-				EffectiveModel:       logEffectiveModel,
+				EffectiveModel:       attemptLogEffectiveModel,
 				StatusCode:           http.StatusOK,
 				DurationMs:           durationMs,
 				PromptTokens:         promptTokens,
@@ -2854,7 +2917,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ChatCompletionValidationRules()
-	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
+	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -2926,7 +2989,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	// /v1/chat/completions 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发（issue #181）。
-	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
@@ -2968,6 +3031,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		isRelayAccount := account.IsOpenAIResponsesAPI()
+		attemptEffectiveModel := effectiveModel
+		attemptLogEffectiveModel := logEffectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig && !isRelayAccount
 		// 真实生图意图强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
 		// 仅凭注入的 image_generation 工具不触发降级，普通请求继续走 WS（issue #304）。
@@ -3009,7 +3074,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var resp *http.Response
 		var reqErr error
 		if isRelayAccount {
-			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, codexBody, proxyURL, downstreamHeaders)
+			upstreamBody := codexBody
+			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel); ok {
+				upstreamBody = mappedBody
+				attemptEffectiveModel = mappedModel
+				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
+			}
+			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死 WS 流（issue #220）。
 			upstreamBody := codexBody
@@ -3082,14 +3153,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, errBody)
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/chat/completions",
 				Model:                logModel,
-				EffectiveModel:       logEffectiveModel,
+				EffectiveModel:       attemptLogEffectiveModel,
 				StatusCode:           resp.StatusCode,
 				DurationMs:           durationMs,
 				ReasoningEffort:      reasoningEffort,
@@ -3293,7 +3364,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var responseFailedDecision codex429Decision
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
-			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
+			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, attemptEffectiveModel)
 			if responseFailedDecision.Reason != "" {
 				outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 			}
@@ -3360,7 +3431,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			AccountID:            account.ID(),
 			Endpoint:             "/v1/chat/completions",
 			Model:                logModel,
-			EffectiveModel:       logEffectiveModel,
+			EffectiveModel:       attemptLogEffectiveModel,
 			StatusCode:           logStatusCode,
 			DurationMs:           totalDuration,
 			FirstTokenMs:         firstTokenMs,
@@ -3395,7 +3466,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
-			h.store.ClearModelCooldown(account, effectiveModel)
+			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
@@ -4104,6 +4175,17 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 				}
 				seen[key] = struct{}{}
 				models = append(models, model)
+			}
+			for _, alias := range accountModelMappingAliases(account) {
+				key := strings.ToLower(strings.TrimSpace(alias))
+				if key == "" {
+					continue
+				}
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+				models = append(models, alias)
 			}
 		}
 	}
